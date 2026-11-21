@@ -227,12 +227,27 @@
     function insertSyntax(id) {
         id = getRelativeID(id);
 
+        // configured default dimensions, injected from the backend
+        const cfg = (JSINFO.plugins && JSINFO.plugins.imgpaste) || {};
+        const w = parseInt(cfg.width, 10) || 0;
+        const h = parseInt(cfg.height, 10) || 0;
+
+        let size = '';
+        if (w > 0 && h > 0) {
+            size = '?' + w + 'x' + h;
+        } else if (w > 0) {
+            size = '?' + w;
+        }
+
         if (typeof window.proseMirrorIsActive !== 'undefined' && window.proseMirrorIsActive === true) {
             const pm = window.Prosemirror.view;
-            const imageNode = pm.state.schema.nodes.image.create({id: id});
+            const attrs = {id: id};
+            if (w > 0) attrs.width = w;
+            if (h > 0) attrs.height = h;
+            const imageNode = pm.state.schema.nodes.image.create(attrs);
             pm.dispatch(pm.state.tr.replaceSelectionWith(imageNode));
         } else {
-            insertAtCarret('wiki__text', '{{' + id + '}}');
+            insertAtCarret('wiki__text', '{{' + id + size + '}}');
         }
     }
 
