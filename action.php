@@ -16,6 +16,7 @@ class action_plugin_imgpaste extends ActionPlugin
 
     protected $tempdir = '';
     protected $tempfile = '';
+    protected $randomCache = null;
 
     /**
      * Clean up on destruction
@@ -29,6 +30,21 @@ class action_plugin_imgpaste extends ActionPlugin
     public function register(EventHandler $controller)
     {
         $controller->register_hook('AJAX_CALL_UNKNOWN', 'BEFORE', $this, 'handleAjaxUpload');
+        $controller->register_hook('DOKUWIKI_STARTED', 'AFTER', $this, 'addJsInfo');
+    }
+
+    /**
+     * Pass the configured image dimensions to the editor's JavaScript
+     *
+     * @param Event $event
+     */
+    public function addJsInfo(Event $event)
+    {
+        global $JSINFO;
+        $JSINFO['plugins']['imgpaste'] = [
+            'width'  => (int) $this->getConf('width'),
+            'height' => (int) $this->getConf('height'),
+        ];
     }
 
 
@@ -114,13 +130,27 @@ class action_plugin_imgpaste extends ActionPlugin
         global $lang;
         global $INPUT;
 
-        // check for supported mime type
-        $mimetypes = array_flip(getMimeTypes());
-        if (!isset($mimetypes[$type])) throw new PasteException($lang['uploadwrong'], 415);
+        // re-encode to the configured format when requested
+        $format = $this->getConf('format');
+        if (!in_array($format, ['png', 'jpeg'], true)) $format = 'original';
+        if ($format !== 'original') {
+            // no need to re-encode when the source already matches the target format
+            $sameSource = ($format === 'png' && $type === 'image/png')
+                || ($format === 'jpeg' && $type === 'image/jpeg');
+            if ($sameSource) {
+                $ext = $format === 'png' ? 'png' : 'jpg';
+            } else {
+                [$data, $type, $ext] = $this->reencodeImage($data, $format);
+            }
+        } else {
+            $mimetypes = array_flip(getMimeTypes());
+            if (!isset($mimetypes[$type])) throw new PasteException($lang['uploadwrong'], 415);
+            $ext = $mimetypes[$type];
+        }
 
         // prepare file names
         $tempname = $this->storetemp($data);
-        $filename = $this->createFileName($INPUT->post->str('id'), $mimetypes[$type], $_SERVER['REMOTE_USER']);
+        $filename = $this->createFileName($INPUT->post->str('id'), $ext, $_SERVER['REMOTE_USER']);
 
         // check ACLs
         $auth = auth_quickaclcheck($filename);
@@ -131,7 +161,7 @@ class action_plugin_imgpaste extends ActionPlugin
             [
                 'name' => $tempname,
                 'mime' => $type,
-                'ext' => $mimetypes[$type],
+                'ext' => $ext,
             ],
             $filename,
             false,
@@ -146,9 +176,61 @@ class action_plugin_imgpaste extends ActionPlugin
             'message' => $lang['uploadsucc'],
             'id' => $result,
             'mime' => $type,
-            'ext' => $mimetypes[$type],
+            'ext' => $ext,
             'url' => ml($result),
         ];
+    }
+
+    /**
+     * Re-encode the given binary image to the requested target format
+     *
+     * @param string $data   binary image data
+     * @param string $format target format: png|jpeg
+     * @return array [data, mime, ext]
+     * @throws PasteException
+     */
+    protected function reencodeImage($data, $format)
+    {
+        if (!function_exists('imagecreatefromstring')) {
+            throw new PasteException($this->getLang('e_encode'), 500);
+        }
+
+        $img = @imagecreatefromstring($data);
+        if (!$img) throw new PasteException($this->getLang('e_encode'), 415);
+
+        $w = imagesx($img);
+        $h = imagesy($img);
+
+        if ($format === 'jpeg') {
+            // JPEG has no alpha channel, composite onto a white background first
+            $bg = imagecreatetruecolor($w, $h);
+            $white = imagecolorallocate($bg, 255, 255, 255);
+            imagefill($bg, 0, 0, $white);
+            imagealphablending($bg, true);
+            imagecopy($bg, $img, 0, 0, 0, 0, $w, $h);
+            imagedestroy($img);
+            $img = $bg;
+
+            $quality = (int) $this->getConf('jpegquality');
+            if ($quality < 1) $quality = 90;
+            if ($quality > 100) $quality = 100;
+
+            ob_start();
+            imagejpeg($img, null, $quality);
+            $data = (string) ob_get_clean();
+            imagedestroy($img);
+
+            return [$data, 'image/jpeg', 'jpg'];
+        }
+
+        // target: png, keep the alpha channel
+        imagesavealpha($img, true);
+        ob_start();
+        imagepng($img, null);
+        $data = (string) ob_get_clean();
+        imagedestroy($img);
+
+        return [$data, 'image/png', 'png'];
     }
 
     /**
@@ -185,17 +267,42 @@ class action_plugin_imgpaste extends ActionPlugin
                 '@ID@',
                 '@USER@',
                 '@PAGE@',
+                '@random@',
             ],
             [
                 getNS($pageid),
                 $pageid,
                 $user,
                 noNS($pageid),
+                $this->randomString(),
             ],
             $filename
         );
         $filename = strftime($filename);
         return cleanID($filename);
+    }
+
+    /**
+     * Create a random lowercase alphanumeric string for the @random@ placeholder
+     *
+     * @return string
+     */
+    protected function randomString()
+    {
+        // keep one random string per request so the ACL check and the final name match
+        if ($this->randomCache !== null) return $this->randomCache;
+
+        $length = (int) $this->getConf('randomlength');
+        if ($length < 1) $length = 8;
+        if ($length > 32) $length = 32;
+
+        $chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+        $str = '';
+        for ($i = 0; $i < $length; $i++) {
+            $str .= $chars[random_int(0, strlen($chars) - 1)];
+        }
+        $this->randomCache = $str;
+        return $str;
     }
 
     /**
